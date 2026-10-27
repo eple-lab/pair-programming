@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>지렁이 게임</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1117; font-family: system-ui, "Malgun Gothic", sans-serif; color: #e6edf3; user-select: none; touch-action: none; }
+  canvas { display: block; }
+  .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(5, 8, 14, .72); }
+  .overlay.hidden { display: none; }
+  .panel { text-align: center; padding: 32px 40px; background: #161b22; border: 1px solid #30363d; border-radius: 16px; max-width: 92vw; }
+  .panel h1 { margin: 0 0 8px; font-size: 40px; letter-spacing: 2px; }
+  .panel p { margin: 6px 0; color: #9da7b3; line-height: 1.5; }
+  .panel input { margin-top: 16px; padding: 10px 14px; font-size: 16px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; width: 220px; text-align: center; }
+  .panel button { margin-top: 14px; padding: 12px 36px; font-size: 18px; font-weight: 700; border: 0; border-radius: 10px; background: #2ea043; color: #fff; cursor: pointer; }
+  .panel button:hover { background: #3fb950; }
+  .stat { font-size: 22px; color: #e6edf3 !important; }
+  #boostBtn { position: fixed; right: 24px; bottom: 24px; width: 84px; height: 84px; border-radius: 50%; border: 2px solid #f0883e; background: rgba(240, 136, 62, .25); color: #fff; font-weight: 700; display: none; }
+  @media (pointer: coarse) { #boostBtn { display: block; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="boostBtn">가속</button>
+
+<div id="startScreen" class="overlay">
+  <div class="panel">
+    <h1>🐛 지렁이 게임</h1>
+    <p>빛나는 먹이를 먹고 성장하세요. 다른 지렁이 몸통에 머리가 닿으면 죽습니다.</p>
+    <p>조작: 마우스 이동 또는 방향키/WASD · 가속: 클릭 또는 Space (길이 감소)</p>
+    <p>일반 먹이 10점 · <span style="color:#ffd700">황금 먹이 50점</span> · 제한 시간 5분</p>
+    <input id="nameInput" maxlength="12" placeholder="닉네임" value="플레이어"><br>
+    <button id="startBtn">시작</button>
+    <p id="bestStart"></p>
+  </div>
+</div>
+
+<div id="endScreen" class="overlay hidden">
+  <div class="panel">
+    <h1 id="endTitle">GAME OVER</h1>
+    <p class="stat" id="endScore"></p>
+    <p id="endDetail"></p>
+    <button id="restartBtn">다시 하기</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- 설정 ----------
+  // 맵은 벽 없이 무한히 이어진다. 플레이어 주변 영역에만 먹이/AI를 유지한다.
+  const ACTIVE_R = 2200;           // 먹이/AI가 유지되는 플레이어 주변 반경
+  const DESPAWN_R = 3200;          // 이보다 멀어지면 정리
+  const RADAR_R = 2500;            // 레이더(미니맵) 표시 반경
+  const GAME_TIME = 5 * 60;        // 제한 시간 (초)
+  const AI_COUNT = 14;
+  const FOOD_COUNT = 900;
+  const SPACING = 6;               // 몸통 마디 간격
+  const BASE_SPEED = 150;          // px/s
+  const BOOST_SPEED = 300;
+  const TURN_RATE = 4.2;           // rad/s
+  const START_LEN = 20;
+  const MIN_BOOST_LEN = 15;
+  const BOOST_COST = 4;            // 가속 시 초당 줄어드는 길이
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const angleDiff = (a, b) => { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+  const COLORS = ['#ff6b6b', '#ffa94d', '#ffd43b', '#69db7c', '#38d9a9', '#4dabf7', '#748ffc', '#da77f2', '#f783ac', '#a9e34b'];
+  const AI_NAMES = ['꿈틀이', '쭉쭉이', '말랑이', '번개', '먹보', '슬리더', '초코', '뱀뱀', '젤리', '구렁이', '스피드', '왕지렁', '꼬물이', '쫄깃이', '누들', '라면'];
+
+  // ---------- 먹이 ----------
+  let foods = [];
+  const FOOD_POINTS = 10;          // 일반 먹이 획득 점수
+  const GOLD_POINTS = 50;          // 황금 먹이 획득 점수
+  const GOLD_CHANCE = 0.05;        // 새 먹이가 황금 먹이일 확률
+  const GOLD_COLOR = '#ffd700';
+  // value: 먹었을 때 늘어나는 길이
+  function makeFood(x, y, value, color, big) {
+    return { x, y, value, points: FOOD_POINTS, color: color || COLORS[(Math.random() * COLORS.length) | 0], r: big ? 7 + value : 4 + value * 1.5, phase: Math.random() * 6.28 };
+  }
+  function makeGoldFood(x, y) {
+    const f = makeFood(x, y, 3, GOLD_COLOR, true);
+    f.points = GOLD_POINTS; f.gold = true;
+    return f;
+  }
+  // 중심(cx, cy)에서 minR~maxR 거리의 임의 위치
+  function randomAround(cx, cy, minR, maxR) {
+    const a = rand(0, Math.PI * 2), d = Math.sqrt(rand(minR * minR, maxR * maxR));
+    return { x: cx + Math.cos(a) * d, y: cy + Math.sin(a) * d };
+  }
+  function spawnFood(cx, cy, minR) {
+    const p = randomAround(cx, cy, minR, ACTIVE_R);
+    foods.push(Math.random() < GOLD_CHANCE ? makeGoldFood(p.x, p.y) : makeFood(p.x, p.y, 1));
+  }
+
+  // ---------- 지렁이 ----------
+  class Worm {
+    constructor(name, color, isPlayer, x, y) {
+      this.name = name; this.color = color; this.isPlayer = isPlayer;
+      this.angle = rand(0, Math.PI * 2);
+      this.targetAngle = this.angle;
+      this.length = START_LEN;
+      this.segs = [];
+      for (let i = 0; i < START_LEN; i++) this.segs.push({ x: x - Math.cos(this.angle) * i * SPACING, y: y - Math.sin(this.angle) * i * SPACING });
+      this.boost = false;
+      this.alive = true;
+      this.dropTimer = 0;
+      this.aiTimer = 0;
+      this.kills = 0;
+      this.score = 0;
+    }
+    get head() { return this.segs[0]; }
+    get radius() { return Math.min(6 + Math.sqrt(this.length) * 0.9, 26); }
+
+    update(dt) {
+      const canBoost = this.boost && this.length > MIN_BOOST_LEN;
+      const speed = canBoost ? BOOST_SPEED : BASE_SPEED;
+      const turn = TURN_RATE * (canBoost ? 0.8 : 1) * dt * Math.max(0.5, 1 - this.length / 600);
+      const d = angleDiff(this.angle, this.targetAngle);
+      this.angle += Math.max(-turn, Math.min(turn, d));
+
+      const h = this.head;
+      h.x += Math.cos(this.angle) * speed * dt;
+      h.y += Math.sin(this.angle) * speed * dt;
+
+      // 마디 따라오기
+      for (let i = 1; i < this.segs.length; i++) {
+        const p = this.segs[i - 1], s = this.segs[i];
+        const dx = s.x - p.x, dy = s.y - p.y;
+        const dist = Math.hypot(dx, dy) || 1;
+        if (dist > SPACING) { s.x = p.x + dx / dist * SPACING; s.y = p.y + dy / dist * SPACING; }
+      }
+
+      // 가속 시 길이 감소 + 먹이 흘리기
+      if (canBoost) {
+        this.length -= BOOST_COST * dt;
+        this.dropTimer += dt;
+        if (this.dropTimer > 0.25) {
+          this.dropTimer = 0;
+          const t = this.segs[this.segs.length - 1];
+          foods.push(makeFood(t.x + rand(-4, 4), t.y + rand(-4, 4), 1, this.color));
+        }
+      }
+
+      // 길이에 맞게 마디 수 조정
+      const want = Math.max(3, Math.floor(this.length));
+      while (this.segs.length < want) { const t = this.segs[this.segs.length - 1]; this.segs.push({ x: t.x, y: t.y }); }
+      while (this.segs.length > want) this.segs.pop();
+    }
+
+    eat() {
+      const h = this.head, r = this.radius + 8;
+      for (let i = foods.length - 1; i >= 0; i--) {
+        const f = foods[i];
+        const dx = f.x - h.x, dy = f.y - h.y;
+        if (Math.abs(dx) > r + 20 || Math.abs(dy) > r + 20) continue;
+        const dist = Math.hypot(dx, dy);
+        if (dist < r + f.r) {
+          this.length += f.value;
+          this.score += f.points;
+          foods[i] = foods[foods.length - 1]; foods.pop();
+        } else if (dist < r + 40) { // 살짝 빨아들이기
+          f.x -= dx / dist * 2; f.y -= dy / dist * 2;
+        }
+      }
+    }
+
+    die() {
+      this.alive = false;
+      // 몸 길이에 비례하는 먹이 남기기 (큰 먹이 = 빠른 성장)
+      const step = Math.max(1, Math.floor(this.segs.length / Math.max(1, this.length / 3)));
+      for (let i = 0; i < this.segs.length; i += step) {
+        const s = this.segs[i];
+        foods.push(makeFood(s.x + rand(-8, 8), s.y + rand(-8, 8), 3, this.color, true));
+      }
+    }
+
+    // ----- AI -----
+    think(dt, worms) {
+      this.aiTimer -= dt;
+      const h = this.head;
+      // 1) 위험 회피: 전방 확인
+      const look = this.radius + 60;
+      let danger = false;
+      for (const side of [0, -0.5, 0.5]) {
+        const a = this.angle + side;
+        const px = h.x + Math.cos(a) * look, py = h.y + Math.sin(a) * look;
+        for (const o of worms) {
+          if (o === this || !o.alive) continue;
+          const rr = o.radius + this.radius + 10;
+          for (let i = 0; i < o.segs.length; i += 2) {
+            const s = o.segs[i];
+            if (Math.abs(s.x - px) < rr && Math.abs(s.y - py) < rr) { danger = true; break; }
+          }
+          if (danger) break;
+        }
+        if (danger) break;
+      }
+      if (danger) {
+        // 가장 안전한 방향 선택
+        let best = this.angle, bestScore = -Infinity;
+        for (let k = 0; k < 12; k++) {
+          const a = this.angle + (k - 6) * (Math.PI / 6);
+          let sc = 0;
+          const px = h.x + Math.cos(a) * look, py = h.y + Math.sin(a) * look;
+          for (const o of worms) {
+            if (o === this || !o.alive) continue;
+            for (let i = 0; i < o.segs.length; i += 3) {
+              const s = o.segs[i];
+              const dd = Math.hypot(s.x - px, s.y - py);
+              if (dd < 120) sc -= (120 - dd);
+            }
+          }
+          sc -= Math.abs(angleDiff(this.angle, a)) * 5;
+          if (sc > bestScore) { bestScore = sc; best = a; }
+        }
+        this.targetAngle = best;
+        this.boost = false;
+        this.aiTimer = 0.3;
+        return;
+      }
+      if (this.aiTimer > 0) return;
+      this.aiTimer = rand(0.2, 0.5);
+
+      // 2) 먹이 찾기 (큰 먹이 우선)
+      let target = null, bestVal = 0;
+      for (const f of foods) {
+        const dx = f.x - h.x, dy = f.y - h.y;
+        if (Math.abs(dx) > 350 || Math.abs(dy) > 350) continue;
+        const dist = Math.hypot(dx, dy) + 1;
+        const v = f.points / dist;
+        if (v > bestVal) { bestVal = v; target = f; }
+      }
+      if (target) {
+        this.targetAngle = Math.atan2(target.y - h.y, target.x - h.x);
+        this.boost = target.value >= 3 && this.length > 40 && Math.random() < 0.5;
+      } else {
+        this.targetAngle += rand(-0.8, 0.8);
+        this.boost = false;
+      }
+    }
+  }
+
+  // ---------- 게임 상태 ----------
+  let worms = [], player = null, camera = { x: 0, y: 0, zoom: 1 };
+  let timeLeft = GAME_TIME, running = false, lastT = 0, maxLength = 0;
+  const input = { mouse: false, mx: 0, my: 0, keys: {}, boostKey: false, boostMouse: false, boostTouch: false };
+
+  // 플레이어 화면 밖(주변 반경 안)에 AI 생성
+  function newAI(cx, cy) {
+    const p = randomAround(cx, cy, 900, ACTIVE_R);
+    const w = new Worm(AI_NAMES[(Math.random() * AI_NAMES.length) | 0], COLORS[(Math.random() * COLORS.length) | 0], false, p.x, p.y);
+    w.length = rand(15, 120);
+    w.score = Math.floor(w.length - START_LEN) * FOOD_POINTS; // 리더보드용 시작 점수
+    return w;
+  }
+
+  function startGame() {
+    const name = (document.getElementById('nameInput').value || '플레이어').trim().slice(0, 12);
+    foods = [];
+    for (let i = 0; i < FOOD_COUNT; i++) spawnFood(0, 0, 0);
+    player = new Worm(name, '#3fb950', true, 0, 0);
+    worms = [player];
+    for (let i = 0; i < AI_COUNT; i++) worms.push(newAI(0, 0));
+    timeLeft = GAME_TIME; maxLength = START_LEN;
+    camera.x = player.head.x; camera.y = player.head.y;
+    document.getElementById('startScreen').classList.add('hidden');
+    document.getElementById('endScreen').classList.add('hidden');
+    running = true;
+    lastT = performance.now();
+  }
+
+  function endGame(timeUp) {
+    running = false;
+    const score = player.score;
+    let best = 0;
+    try { best = +localStorage.getItem('worm_best') || 0; if (score > best) { localStorage.setItem('worm_best', score); } } catch (e) {}
+    document.getElementById('endTitle').textContent = timeUp ? 'TIME UP!' : 'GAME OVER';
+    document.getElementById('endScore').textContent = `점수 ${score.toLocaleString()}`;
+    const survived = GAME_TIME - Math.ceil(timeLeft);
+    document.getElementById('endDetail').textContent =
+      `최대 길이 ${Math.floor(maxLength)} · 처치 ${player.kills} · 생존 ${Math.floor(survived / 60)}분 ${survived % 60}초` +
+      (score > best ? ' · 🏆 최고 기록!' : ` · 최고 기록 ${Math.max(best, score).toLocaleString()}`);
+    document.getElementById('endScreen').classList.remove('hidden');
+  }
+
+  // ---------- 충돌 ----------
+  function checkCollisions() {
+    for (const w of worms) {
+      if (!w.alive) continue;
+      const h = w.head, hr = w.radius * 0.8;
+      outer:
+      for (const o of worms) {
+        if (o === w || !o.alive) continue;
+        const rr = hr + o.radius * 0.9;
+        for (let i = 1; i < o.segs.length; i++) {
+          const s = o.segs[i];
+          const dx = s.x - h.x, dy = s.y - h.y;
+          if (dx * dx + dy * dy < rr * rr) { w.alive = false; o.kills++; break outer; }
+        }
+      }
+    }
+  }
+
+  // ---------- 업데이트 ----------
+  function updatePlayerInput() {
+    const k = input.keys;
+    let kx = (k.ArrowRight || k.KeyD ? 1 : 0) - (k.ArrowLeft || k.KeyA ? 1 : 0);
+    let ky = (k.ArrowDown || k.KeyS ? 1 : 0) - (k.ArrowUp || k.KeyW ? 1 : 0);
+    if (kx || ky) { input.mouse = false; player.targetAngle = Math.atan2(ky, kx); }
+    else if (input.mouse) {
+      player.targetAngle = Math.atan2(input.my - H / 2, input.mx - W / 2);
+    }
+    player.boost = input.boostKey || input.boostMouse || input.boostTouch;
+  }
+
+  function update(dt) {
+    updatePlayerInput();
+    for (const w of worms) if (!w.isPlayer && w.alive) w.think(dt, worms);
+    for (const w of worms) if (w.alive) { w.update(dt); }
+    for (const w of worms) if (w.alive) w.eat();
+    checkCollisions();
+    for (const w of worms) if (!w.alive && !w.dead) { w.dead = true; w.die(); }
+
+    if (!player.alive) { endGame(false); return; }
+    maxLength = Math.max(maxLength, player.length);
+
+    // 멀리 벗어난 AI/먹이 정리 후 플레이어 주변에 다시 채우기 (무한 맵)
+    const px = player.head.x, py = player.head.y, far2 = DESPAWN_R * DESPAWN_R;
+    worms = worms.filter(w => w.alive && (w === player || (w.head.x - px) ** 2 + (w.head.y - py) ** 2 < far2));
+    while (worms.length < AI_COUNT + 1) worms.push(newAI(px, py));
+    foods = foods.filter(f => (f.x - px) ** 2 + (f.y - py) ** 2 < far2);
+    let missing = FOOD_COUNT - foods.length;
+    for (let i = 0; i < Math.min(missing, 5); i++) spawnFood(px, py, 900);
+    if (foods.length > FOOD_COUNT * 2.5) foods.splice(0, foods.length - FOOD_COUNT * 2.5);
+
+    timeLeft -= dt;
+    if (timeLeft <= 0) { timeLeft = 0; endGame(true); }
+
+    // 카메라
+    const targetZoom = Math.max(0.55, 1 - (player.length - START_LEN) / 900);
+    camera.zoom += (targetZoom - camera.zoom) * Math.min(1, dt * 2);
+    camera.x += (player.head.x - camera.x) * Math.min(1, dt * 8);
+    camera.y += (player.head.y - camera.y) * Math.min(1, dt * 8);
+  }
+
+  // ---------- 렌더 ----------
+  function drawWorm(w, t) {
+    const r = w.radius;
+    const segs = w.segs;
+    // 가속 중 빛
+    if (w.boost && w.length > MIN_BOOST_LEN) { ctx.shadowColor = w.color; ctx.shadowBlur = 20; }
+    for (let i = segs.length - 1; i >= 0; i--) {
+      const s = segs[i];
+      ctx.fillStyle = (i % 6 < 3) ? w.color : shade(w.color, -25);
+      ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+    // 눈
+    const h = segs[0], a = w.angle;
+    for (const side of [-1, 1]) {
+      const ex = h.x + Math.cos(a + side * 0.6) * r * 0.55, ey = h.y + Math.sin(a + side * 0.6) * r * 0.55;
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex, ey, r * 0.38, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(ex + Math.cos(a) * r * 0.15, ey + Math.sin(a) * r * 0.15, r * 0.2, 0, Math.PI * 2); ctx.fill();
+    }
+    // 이름
+    ctx.fillStyle = w.isPlayer ? '#fff' : 'rgba(255,255,255,.75)';
+    ctx.font = `${w.isPlayer ? 'bold ' : ''}14px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(w.name, h.x, h.y - r - 10);
+  }
+
+  const shadeCache = {};
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache[key]) return shadeCache[key];
+    const n = parseInt(hex.slice(1), 16);
+    const c = v => Math.max(0, Math.min(255, v + amt));
+    return shadeCache[key] = `rgb(${c(n >> 16)},${c((n >> 8) & 255)},${c(n & 255)})`;
+  }
+
+  function render(t) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#0d1117';
+    ctx.fillRect(0, 0, W, H);
+    if (!player) return;
+
+    const z = camera.zoom;
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.scale(z, z);
+    ctx.translate(-camera.x, -camera.y);
+
+    const vx0 = camera.x - W / 2 / z - 50, vx1 = camera.x + W / 2 / z + 50;
+    const vy0 = camera.y - H / 2 / z - 50, vy1 = camera.y + H / 2 / z + 50;
+
+    // 맵 배경 + 격자 (끝없이 이어짐)
+    ctx.fillStyle = '#121a24';
+    ctx.fillRect(vx0, vy0, vx1 - vx0, vy1 - vy0);
+    ctx.strokeStyle = 'rgba(255,255,255,.04)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    const g = 80;
+    for (let x = Math.floor(vx0 / g) * g; x <= vx1; x += g) { ctx.moveTo(x, vy0); ctx.lineTo(x, vy1); }
+    for (let y = Math.floor(vy0 / g) * g; y <= vy1; y += g) { ctx.moveTo(vx0, y); ctx.lineTo(vx1, y); }
+    ctx.stroke();
+
+    // 먹이 (빛나는 효과)
+    const ts = t / 1000;
+    for (const f of foods) {
+      if (f.x < vx0 || f.x > vx1 || f.y < vy0 || f.y > vy1) continue;
+      const pulse = 0.75 + 0.25 * Math.sin(ts * 4 + f.phase);
+      ctx.globalAlpha = 0.25 * pulse;
+      ctx.fillStyle = f.color;
+      ctx.beginPath(); ctx.arc(f.x, f.y, f.r * 2.2, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+      if (f.gold) { ctx.shadowColor = GOLD_COLOR; ctx.shadowBlur = 25; }
+      ctx.beginPath(); ctx.arc(f.x, f.y, f.r * pulse, 0, Math.PI * 2); ctx.fill();
+      if (f.gold) {
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#fff8dc';
+        ctx.beginPath(); ctx.arc(f.x - f.r * 0.3, f.y - f.r * 0.3, f.r * 0.3, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // 지렁이 (플레이어는 마지막에)
+    for (const w of worms) {
+      if (w === player || !w.alive) continue;
+      const h = w.head;
+      if (h.x < vx0 - 1000 || h.x > vx1 + 1000 || h.y < vy0 - 1000 || h.y > vy1 + 1000) continue;
+      drawWorm(w, t);
+    }
+    if (player.alive) drawWorm(player, t);
+    ctx.restore();
+
+    drawHUD();
+  }
+
+  function drawHUD() {
+    // 점수/길이/시간
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.fillRect(12, 12, 190, 78);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px system-ui, sans-serif';
+    ctx.fillText(`점수 ${player.score.toLocaleString()}`, 24, 38);
+    ctx.font = '14px system-ui, sans-serif';
+    ctx.fillStyle = '#9da7b3';
+    ctx.fillText(`길이 ${Math.floor(player.length)} · 처치 ${player.kills}`, 24, 60);
+    const m = Math.floor(timeLeft / 60), s = Math.floor(timeLeft % 60);
+    ctx.fillStyle = timeLeft < 30 ? '#f85149' : '#e6edf3';
+    ctx.fillText(`남은 시간 ${m}:${String(s).padStart(2, '0')}`, 24, 80);
+
+    // 리더보드
+    const top = [...worms].filter(w => w.alive).sort((a, b) => b.score - a.score);
+    const rank = top.indexOf(player) + 1;
+    const lw = 190, lx = W - lw - 12;
+    const rows = Math.min(10, top.length);
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.fillRect(lx, 12, lw, 34 + rows * 20 + (rank > 10 ? 22 : 0));
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 14px system-ui, sans-serif';
+    ctx.fillText('리더보드', lx + 12, 32);
+    ctx.font = '13px system-ui, sans-serif';
+    for (let i = 0; i < rows; i++) {
+      const w = top[i];
+      ctx.fillStyle = w === player ? '#3fb950' : '#c9d1d9';
+      ctx.textAlign = 'left';
+      ctx.fillText(`${i + 1}. ${w.name}`, lx + 12, 54 + i * 20);
+      ctx.textAlign = 'right';
+      ctx.fillText(w.score.toLocaleString(), lx + lw - 12, 54 + i * 20);
+    }
+    if (rank > 10) {
+      ctx.fillStyle = '#3fb950'; ctx.textAlign = 'left';
+      ctx.fillText(`${rank}. ${player.name}`, lx + 12, 54 + rows * 20 + 4);
+      ctx.textAlign = 'right';
+      ctx.fillText(player.score.toLocaleString(), lx + lw - 12, 54 + rows * 20 + 4);
+    }
+
+    // 레이더: 플레이어 중심으로 주변 지렁이 표시
+    const rr = 65, cx = 12 + rr, cy = H - 12 - rr, sc = rr / RADAR_R;
+    ctx.fillStyle = 'rgba(0,0,0,.5)';
+    ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 1;
+    ctx.stroke();
+    for (const w of worms) {
+      if (!w.alive) continue;
+      const dx = (w.head.x - player.head.x) * sc, dy = (w.head.y - player.head.y) * sc;
+      if (dx * dx + dy * dy > rr * rr) continue;
+      ctx.fillStyle = w === player ? '#fff' : w.color;
+      const sz = w === player ? 5 : 3;
+      ctx.fillRect(cx + dx - sz / 2, cy + dy - sz / 2, sz, sz);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  // ---------- 루프 ----------
+  function loop(t) {
+    if (running) {
+      const dt = Math.min(0.05, (t - lastT) / 1000);
+      lastT = t;
+      update(dt);
+    }
+    render(t);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ---------- 입력 ----------
+  window.addEventListener('mousemove', e => { input.mouse = true; input.mx = e.clientX; input.my = e.clientY; });
+  canvas.addEventListener('mousedown', () => { input.boostMouse = true; });
+  window.addEventListener('mouseup', () => { input.boostMouse = false; });
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space') { input.boostKey = true; e.preventDefault(); }
+    else input.keys[e.code] = true;
+    if (e.code === 'Enter' && !running) startGame();
+  });
+  window.addEventListener('keyup', e => {
+    if (e.code === 'Space') input.boostKey = false;
+    else input.keys[e.code] = false;
+  });
+  window.addEventListener('blur', () => { input.keys = {}; input.boostKey = input.boostMouse = input.boostTouch = false; });
+  // 터치: 화면을 누른 위치로 방향 전환
+  canvas.addEventListener('touchstart', e => { const p = e.touches[0]; input.mouse = true; input.mx = p.clientX; input.my = p.clientY; e.preventDefault(); }, { passive: false });
+  canvas.addEventListener('touchmove', e => { const p = e.touches[0]; input.mx = p.clientX; input.my = p.clientY; e.preventDefault(); }, { passive: false });
+  const boostBtn = document.getElementById('boostBtn');
+  boostBtn.addEventListener('touchstart', e => { input.boostTouch = true; e.preventDefault(); }, { passive: false });
+  boostBtn.addEventListener('touchend', e => { input.boostTouch = false; e.preventDefault(); }, { passive: false });
+
+  document.getElementById('startBtn').addEventListener('click', startGame);
+  document.getElementById('restartBtn').addEventListener('click', startGame);
+  try { const b = +localStorage.getItem('worm_best') || 0; if (b) document.getElementById('bestStart').textContent = `최고 기록 ${b.toLocaleString()}`; } catch (e) {}
+})();
+</script>
+</body>
+</html>
